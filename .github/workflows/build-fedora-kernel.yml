@@ -63,6 +63,7 @@ jobs:
         env:
           KERNEL_VERSION: ${{ inputs.kernel_version }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
+          CUSTOM_CMDLINE: ${{ inputs.custom_cmdline }}
         run: |
           set -euo pipefail
 
@@ -86,6 +87,11 @@ jobs:
 
           if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "::error::Release tag contains unsupported characters: $RELEASE_TAG"
+            exit 1
+          fi
+
+          if [[ "$CUSTOM_CMDLINE" == *$'\n'* || "$CUSTOM_CMDLINE" == *$'\r'* ]]; then
+            echo "::error::The custom kernel command line must be a single line"
             exit 1
           fi
 
@@ -155,9 +161,10 @@ jobs:
       _force_all_threads: "true"
       _kernel_work_folder: /tmp
       _kernel_source_folder: /tmp
-      _custom_commandline: ${{ inputs.custom_cmdline || 'quiet loglevel=3 systemd.show_status=auto udev.log_priority=3 nowatchdog nmi_watchdog=0 split_lock_detect=off mitigations=off' }}
+      _EXT_CONFIG_PATH: ${{ github.workspace }}/linux-tkg/ludus.cfg
       LINUX_TKG_REF: ${{ needs.metadata.outputs.linux_tkg_ref }}
       MODULES_STRATEGY: ${{ inputs.modules_strategy }}
+      KERNEL_CMDLINE: ${{ inputs.custom_cmdline || 'quiet loglevel=3 systemd.show_status=auto udev.log_priority=3 nowatchdog nmi_watchdog=0 split_lock_detect=off mitigations=off' }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_COMPILERCHECK: content
@@ -227,6 +234,15 @@ jobs:
             echo "::error::Expected linux-tkg $LINUX_TKG_REF, got $ACTUAL_REF"
             exit 1
           fi
+
+          printf '_custom_commandline=%q\n' "$KERNEL_CMDLINE" > "$_EXT_CONFIG_PATH"
+          bash -n "$_EXT_CONFIG_PATH"
+          (
+            unset _custom_commandline
+            # shellcheck source=/dev/null
+            source "$_EXT_CONFIG_PATH"
+            test "$_custom_commandline" = "$KERNEL_CMDLINE"
+          )
 
       - name: Build RPM packages
         working-directory: linux-tkg
