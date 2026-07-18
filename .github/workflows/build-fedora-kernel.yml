@@ -1,0 +1,421 @@
+name: Build Fedora 44 RPM kernels
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: Kernel version (for example, v7.1.3 or 7.1-latest)
+        required: true
+        default: 7.1-latest
+        type: string
+      modules_strategy:
+        description: Kernel module selection strategy
+        required: true
+        default: modprobed
+        type: choice
+        options:
+          - modprobed
+          - diet
+          - full
+      cpusched:
+        description: CPU scheduler
+        required: true
+        default: bore
+        type: choice
+        options:
+          - bore
+          - eevdf
+          - pds
+          - bmq
+      custom_cmdline:
+        description: Built-in kernel command line (empty uses the Ludus default)
+        required: false
+        default: ""
+        type: string
+      release_tag:
+        description: GitHub release tag (empty uses version, scheduler and module strategy)
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ludus-kernel-${{ inputs.kernel_version }}-${{ inputs.cpusched }}-${{ inputs.modules_strategy }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Validate build request
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel_version: ${{ steps.validate.outputs.kernel_version }}
+      linux_tkg_ref: ${{ steps.validate.outputs.linux_tkg_ref }}
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate inputs and pinned sources
+        id: validate
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ inputs.kernel_version }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$KERNEL_VERSION" =~ ^v?[0-9]+\.[0-9]+(\.[0-9]+)?(-rc[0-9]+)?$ && \
+                ! "$KERNEL_VERSION" =~ ^[0-9]+\.[0-9]+-latest$ ]]; then
+            echo "::error::Unsupported kernel version format: $KERNEL_VERSION"
+            exit 1
+          fi
+
+          LINUX_TKG_REF="$(tr -d '[:space:]' < .github/linux-tkg-ref.txt)"
+          if [[ ! "$LINUX_TKG_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::.github/linux-tkg-ref.txt must contain one full commit SHA"
+            exit 1
+          fi
+
+          if [ -n "$REQUESTED_TAG" ]; then
+            RELEASE_TAG="$REQUESTED_TAG"
+          else
+            RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-${{ inputs.cpusched }}-${{ inputs.modules_strategy }}"
+          fi
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Release tag contains unsupported characters: $RELEASE_TAG"
+            exit 1
+          fi
+
+          {
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "linux_tkg_ref=$LINUX_TKG_REF"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Fedora 44 kernel build"
+            echo "- Kernel: \`$KERNEL_VERSION\`"
+            echo "- linux-tkg: \`$LINUX_TKG_REF\`"
+            echo "- Release: \`$RELEASE_TAG\`"
+            echo "- Scheduler: \`${{ inputs.cpusched }}\`"
+            echo "- Modules: \`${{ inputs.modules_strategy }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: ${{ matrix.cpu }} / ${{ matrix.toolchain.name }}
+    needs: metadata
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    container:
+      image: fedora:44
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu:
+          - x86-64
+          - x86-64-v2
+          - x86-64-v3
+          - x86-64-v4
+          - znver3
+        toolchain:
+          - name: llvm-thin
+            compiler: llvm
+            lto: thin
+          - name: gcc
+            compiler: gcc
+            lto: "no"
+    env:
+      _distro: Fedora
+      _version: ${{ needs.metadata.outputs.kernel_version }}
+      _git_mirror: gregkh
+      _processor_opt: ${{ matrix.cpu }}
+      _kernel_localversion: ludus-${{ matrix.cpu }}-${{ matrix.toolchain.name }}-${{ inputs.cpusched }}-${{ inputs.modules_strategy }}
+      _cpusched: ${{ inputs.cpusched }}
+      _compiler: ${{ matrix.toolchain.compiler }}
+      _llvm_ias: "1"
+      _lto_mode: ${{ matrix.toolchain.lto }}
+      _tcp_cong_alg: bbr
+      _default_cpu_gov: performance
+      _tickless: "2"
+      _timer_freq: "1000"
+      _acs_override: "false"
+      _logging_use_script: "no"
+      _install_after_building: "no"
+      _menunconfig: "false"
+      _modprobeddb: "false"
+      _kernel_on_diet: "false"
+      _modprobeddb_db_path: ${{ github.workspace }}/modprobed/generic/modprobed.db
+      _debugdisable: "true"
+      _noccache: "false"
+      _STRIP: "true"
+      _nofallback: "true"
+      _force_all_threads: "true"
+      _kernel_work_folder: /tmp
+      _kernel_source_folder: /tmp
+      _custom_commandline: ${{ inputs.custom_cmdline || 'quiet loglevel=3 systemd.show_status=auto udev.log_priority=3 nowatchdog nmi_watchdog=0 split_lock_detect=off mitigations=off' }}
+      LINUX_TKG_REF: ${{ needs.metadata.outputs.linux_tkg_ref }}
+      MODULES_STRATEGY: ${{ inputs.modules_strategy }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_COMPILERCHECK: content
+      CCACHE_COMPRESS: "true"
+      CCACHE_MAXSIZE: 1G
+    steps:
+      - name: Install container prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf install -y git gawk findutils sudo tar zstd ccache
+
+      - name: Checkout project
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Mark workspace as safe
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Restore compiler cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-f44-${{ matrix.toolchain.name }}-${{ matrix.cpu }}-${{ needs.metadata.outputs.kernel_version }}
+          restore-keys: |
+            ccache-f44-${{ matrix.toolchain.name }}-${{ matrix.cpu }}-
+
+      - name: Configure module selection
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$MODULES_STRATEGY" in
+            modprobed)
+              if [ ! -s "$_modprobeddb_db_path" ]; then
+                echo "::error::Missing or empty modprobed database: $_modprobeddb_db_path"
+                exit 1
+              fi
+              echo "_modprobeddb=true" >> "$GITHUB_ENV"
+              echo "_kernel_on_diet=false" >> "$GITHUB_ENV"
+              ;;
+            diet)
+              echo "_modprobeddb=false" >> "$GITHUB_ENV"
+              echo "_kernel_on_diet=true" >> "$GITHUB_ENV"
+              ;;
+            full)
+              echo "_modprobeddb=false" >> "$GITHUB_ENV"
+              echo "_kernel_on_diet=false" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error::Unsupported module strategy: $MODULES_STRATEGY"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout pinned linux-tkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init linux-tkg
+          git -C linux-tkg remote add origin https://github.com/Frogging-Family/linux-tkg.git
+          git -C linux-tkg fetch --depth=1 origin "$LINUX_TKG_REF"
+          git -C linux-tkg checkout --detach FETCH_HEAD
+
+          ACTUAL_REF="$(git -C linux-tkg rev-parse HEAD)"
+          if [ "$ACTUAL_REF" != "$LINUX_TKG_REF" ]; then
+            echo "::error::Expected linux-tkg $LINUX_TKG_REF, got $ACTUAL_REF"
+            exit 1
+          fi
+
+      - name: Build RPM packages
+        working-directory: linux-tkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          ccache --zero-stats
+          set +o pipefail
+          yes "" | ./install.sh install
+          set -o pipefail
+
+      - name: Show compiler cache statistics
+        if: always()
+        shell: bash
+        run: ccache --show-stats || true
+
+      - name: Validate and collect RPM packages
+        shell: bash
+        env:
+          ARTIFACT_ID: ${{ matrix.cpu }}-${{ matrix.toolchain.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          mapfile -t RPM_FILES < <(find linux-tkg/RPMS -maxdepth 1 -type f -name '*.rpm' -print | sort)
+          if [ "${#RPM_FILES[@]}" -eq 0 ]; then
+            echo "::error::linux-tkg did not produce RPM packages"
+            exit 1
+          fi
+
+          KERNEL_COUNT=0
+          DEVEL_COUNT=0
+          for RPM_FILE in "${RPM_FILES[@]}"; do
+            PACKAGE_NAME="$(rpm -qp --queryformat '%{NAME}' "$RPM_FILE")"
+            case "$PACKAGE_NAME" in
+              kernel|kernel-devel)
+                PACKAGE_ARCH="$(rpm -qp --queryformat '%{ARCH}' "$RPM_FILE")"
+                if [ "$PACKAGE_ARCH" != "x86_64" ]; then
+                  echo "::error::Unexpected RPM architecture $PACKAGE_ARCH: $RPM_FILE"
+                  exit 1
+                fi
+                cp "$RPM_FILE" dist/
+                if [ "$PACKAGE_NAME" = "kernel" ]; then
+                  KERNEL_COUNT=$((KERNEL_COUNT + 1))
+                else
+                  DEVEL_COUNT=$((DEVEL_COUNT + 1))
+                fi
+                ;;
+              *)
+                echo "Skipping $PACKAGE_NAME: $RPM_FILE"
+                ;;
+            esac
+          done
+
+          if [ "$KERNEL_COUNT" -ne 1 ] || [ "$DEVEL_COUNT" -ne 1 ]; then
+            echo "::error::Expected one kernel and one kernel-devel RPM; found $KERNEL_COUNT and $DEVEL_COUNT"
+            exit 1
+          fi
+
+          cp linux-tkg/kernelconfig.new "dist/config-${ARTIFACT_ID}.txt"
+
+          {
+            echo "kernel_request=${_version}"
+            echo "linux_tkg_ref=${LINUX_TKG_REF}"
+            echo "cpu=${_processor_opt}"
+            echo "compiler=${_compiler}"
+            echo "lto=${_lto_mode}"
+            echo "scheduler=${_cpusched}"
+            echo "modules=${MODULES_STRATEGY}"
+            echo
+            for RPM_FILE in dist/*.rpm; do
+              rpm -qp --queryformat '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' "$RPM_FILE"
+            done
+          } > "dist/manifest-${ARTIFACT_ID}.txt"
+
+          (
+            cd dist
+            sha256sum -- *.rpm > "SHA256SUMS-${ARTIFACT_ID}"
+          )
+
+      - name: Remove kernel build tree
+        if: always()
+        shell: bash
+        run: |
+          rm -rf /tmp/linux-tkg
+          df -h /
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: kernel-rpm-${{ matrix.cpu }}-${{ matrix.toolchain.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish complete RPM release
+    needs:
+      - metadata
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all RPM artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: kernel-rpm-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate complete release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t RPM_FILES < <(find release-assets -maxdepth 1 -type f -name '*.rpm' -print | sort)
+          CONFIG_COUNT="$(find release-assets -maxdepth 1 -type f -name 'config-*.txt' | wc -l)"
+          MANIFEST_COUNT="$(find release-assets -maxdepth 1 -type f -name 'manifest-*.txt' | wc -l)"
+
+          if [ "${#RPM_FILES[@]}" -ne 20 ]; then
+            echo "::error::Expected 20 RPM packages, found ${#RPM_FILES[@]}"
+            exit 1
+          fi
+          if [ "$CONFIG_COUNT" -ne 10 ] || [ "$MANIFEST_COUNT" -ne 10 ]; then
+            echo "::error::Expected 10 configs and manifests, found $CONFIG_COUNT configs and $MANIFEST_COUNT manifests"
+            exit 1
+          fi
+
+          DUPLICATES="$(printf '%s\n' "${RPM_FILES[@]##*/}" | sort | uniq -d)"
+          if [ -n "$DUPLICATES" ]; then
+            echo "::error::Duplicate RPM filenames detected:"
+            echo "$DUPLICATES"
+            exit 1
+          fi
+
+          (
+            cd release-assets
+            sha256sum -- *.rpm > SHA256SUMS
+          )
+
+      - name: Create release notes
+        shell: bash
+        env:
+          KERNEL_VERSION: ${{ needs.metadata.outputs.kernel_version }}
+          LINUX_TKG_REF: ${{ needs.metadata.outputs.linux_tkg_ref }}
+          MODULES_STRATEGY: ${{ inputs.modules_strategy }}
+          CPU_SCHEDULER: ${{ inputs.cpusched }}
+        run: |
+          cat > release-notes.md <<EOF
+          Fedora 44 RPM packages for Linux ${KERNEL_VERSION}, built with linux-tkg.
+
+          Variants: x86-64, x86-64-v2, x86-64-v3, x86-64-v4 and znver3.
+          Toolchains: LLVM with ThinLTO, and GCC without LTO.
+          Scheduler: ${CPU_SCHEDULER}.
+          Module strategy: ${MODULES_STRATEGY}.
+          linux-tkg commit: ${LINUX_TKG_REF}.
+
+          Install the matching kernel and kernel-devel RPMs for exactly one CPU/toolchain variant.
+          These kernels are not signed for Fedora Secure Boot.
+          EOF
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.release_tag }}
+          KERNEL_VERSION: ${{ needs.metadata.outputs.kernel_version }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Ludus Kernel ${KERNEL_VERSION} (Fedora 44)" \
+              --notes-file release-notes.md
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Ludus Kernel ${KERNEL_VERSION} (Fedora 44)" \
+              --notes-file release-notes.md
+          fi
+
+          mapfile -t RELEASE_ASSETS < <(
+            find release-assets -maxdepth 1 -type f \
+              \( -name '*.rpm' -o -name 'config-*.txt' -o -name 'manifest-*.txt' -o -name 'SHA256SUMS' \) \
+              -print | sort
+          )
+          gh release upload "$RELEASE_TAG" "${RELEASE_ASSETS[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber

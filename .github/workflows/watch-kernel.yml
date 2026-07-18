@@ -1,0 +1,126 @@
+name: Watch Linux stable releases
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: watch-linux-stable
+  cancel-in-progress: true
+
+jobs:
+  watch:
+    name: Detect and dispatch new stable kernel
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Detect latest stable kernel
+        id: kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RELEASES="$(curl --fail --silent --show-error --location https://www.kernel.org/releases.json)"
+          VERSION="$(
+            jq -r \
+              '[.releases[] | select(.moniker == "stable" and (.iseol | not))] | max_by(.released.timestamp) | .version' \
+              <<< "$RELEASES"
+          )"
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::Unable to determine the latest stable kernel"
+            exit 1
+          fi
+
+          KERNEL_VERSION="v${VERSION#v}"
+          RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-bore-modprobed"
+          {
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "release_tag=$RELEASE_TAG"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Latest stable kernel: $KERNEL_VERSION"
+
+      - name: Decide whether to build
+        id: decision
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_VERSION: ${{ steps.kernel.outputs.kernel_version }}
+          RELEASE_TAG: ${{ steps.kernel.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            RPM_COUNT="$(
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '[.assets[] | select(.name | endswith(".rpm"))] | length'
+            )"
+            CONFIG_COUNT="$(
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '[.assets[] | select(.name | startswith("config-") and endswith(".txt"))] | length'
+            )"
+            CHECKSUM_COUNT="$(
+              gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                --jq '[.assets[] | select(.name == "SHA256SUMS")] | length'
+            )"
+
+            if [ "$RPM_COUNT" -eq 20 ] && [ "$CONFIG_COUNT" -eq 10 ] && [ "$CHECKSUM_COUNT" -eq 1 ]; then
+              echo "Complete release $RELEASE_TAG already exists; nothing to build."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "::warning::Release $RELEASE_TAG is incomplete and will be rebuilt"
+          fi
+
+          ACTIVE_RUNS="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/build-fedora-kernel.yml/runs?per_page=20" \
+              --jq '[.workflow_runs[] | select(.status == "queued" or .status == "in_progress" or .status == "waiting" or .status == "requested" or .status == "pending")] | length'
+          )"
+          if [ "$ACTIVE_RUNS" -gt 0 ]; then
+            echo "A Fedora kernel build is already active; deferring this version."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LINUX_TKG_REF="$(tr -d '[:space:]' < .github/linux-tkg-ref.txt)"
+          if [[ ! "$LINUX_TKG_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::.github/linux-tkg-ref.txt must contain one full commit SHA"
+            exit 1
+          fi
+
+          VERSION_WITHOUT_V="${KERNEL_VERSION#v}"
+          SERIES="$(cut -d. -f1,2 <<< "$VERSION_WITHOUT_V")"
+          CONFIG_URL="https://raw.githubusercontent.com/Frogging-Family/linux-tkg/${LINUX_TKG_REF}/linux-tkg-config/${SERIES}/config.x86_64"
+          HTTP_CODE="$(curl --silent --location --output /dev/null --write-out '%{http_code}' "$CONFIG_URL")"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::warning::Pinned linux-tkg commit $LINUX_TKG_REF does not support kernel series $SERIES yet"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch Fedora RPM matrix
+        if: steps.decision.outputs.should_build == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KERNEL_VERSION: ${{ steps.kernel.outputs.kernel_version }}
+        run: |
+          set -euo pipefail
+          gh workflow run build-fedora-kernel.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            --field kernel_version="$KERNEL_VERSION" \
+            --field modules_strategy=modprobed \
+            --field cpusched=bore
