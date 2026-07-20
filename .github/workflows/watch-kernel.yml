@@ -40,7 +40,7 @@ jobs:
           fi
 
           KERNEL_VERSION="v${VERSION#v}"
-          RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-bore"
+          RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-bore-full"
           {
             echo "kernel_version=$KERNEL_VERSION"
             echo "release_tag=$RELEASE_TAG"
