@@ -40,7 +40,7 @@ jobs:
           fi
 
           KERNEL_VERSION="v${VERSION#v}"
-          RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-bore-modprobed"
+          RELEASE_TAG="ludus-kernel-${KERNEL_VERSION#v}-bore"
           {
             echo "kernel_version=$KERNEL_VERSION"
             echo "release_tag=$RELEASE_TAG"
@@ -122,5 +122,5 @@ jobs:
             --repo "$GITHUB_REPOSITORY" \
             --ref main \
             --field kernel_version="$KERNEL_VERSION" \
-            --field modules_strategy=modprobed \
+            --field modules_strategy=full \
             --field cpusched=bore
